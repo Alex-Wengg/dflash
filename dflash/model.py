@@ -154,6 +154,16 @@ def _crop_to(cache, length):
     cache.crop(-remove)
 
 
+def _recurrent_states(cache):
+    # Linear-attention layers (e.g. Gated DeltaNet) keep a recurrent state that `crop` does not roll back.
+    return [
+        state
+        for layer in cache.layers
+        for state in (getattr(layer, "recurrent_states", None) or {}).values()
+        if state is not None
+    ]
+
+
 def _attention_mask(query, key, *, is_causal, sliding_window):
     query_position = key.shape[-2] - query.shape[-2] + torch.arange(
         query.shape[-2], device=query.device
@@ -266,6 +276,8 @@ def dflash_generate(
                     draft_indices = None
                 else:
                     block_output_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
+        recurrent_states = _recurrent_states(past_key_values_target) if verify_size > 1 else []
+        saved_recurrent_states = [state.clone() for state in recurrent_states]
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
@@ -300,6 +312,19 @@ def dflash_generate(
             if stop_indices.numel() > 0:
                 produced = stop_indices[0].item() + 1
                 stopped = True
+        if recurrent_states and produced < verify_size:
+            # The verify forward advanced the recurrent states past rejected drafts: rewind them and replay the
+            # committed tokens so the next block is verified against the same state as autoregressive decoding.
+            _crop_to(past_key_values_target, start)
+            for state, saved in zip(recurrent_states, saved_recurrent_states):
+                state.copy_(saved)
+            target(
+                block_output_ids[:, :produced],
+                position_ids=block_position_ids[:, :produced],
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                logits_to_keep=1,
+            )
         start += produced
         _crop_to(past_key_values_target, start)
         acceptance_lengths.append(produced)
